@@ -43,23 +43,37 @@ pub struct LocalNetworking {
     selector: Arc<Selector>,
     handle: Handle,
     ruleset: Option<Ruleset>,
+    connect_timeout: Duration,
 }
 
 impl LocalNetworking {
+    /// How long `connect_tcp` waits for an outbound TCP handshake unless configured otherwise.
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
     pub fn new() -> Self {
         Self {
             selector: Selector::new(),
             handle: Handle::current(),
             ruleset: None,
+            connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
         }
     }
 
     pub fn with_ruleset(ruleset: Ruleset) -> Self {
-        Self {
-            selector: Selector::new(),
-            handle: Handle::current(),
-            ruleset: Some(ruleset),
-        }
+        let mut ret = Self::new();
+        ret.ruleset = Some(ruleset);
+        ret
+    }
+
+    /// Sets how long `connect_tcp` waits for the TCP handshake before failing with
+    /// [`NetworkError::TimedOut`]. Slow or distant peers can need more than the default.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
     }
 }
 
@@ -254,7 +268,7 @@ impl VirtualNetworking for LocalNetworking {
         }
 
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(3);
+        let timeout = self.connect_timeout;
 
         loop {
             #[cfg(not(target_os = "windows"))]
@@ -307,7 +321,8 @@ impl VirtualNetworking for LocalNetworking {
             }
 
             if start.elapsed() > timeout {
-                return Err(NetworkError::IOError);
+                tracing::debug!(%peer, ?timeout, "connect_tcp timed out");
+                return Err(NetworkError::TimedOut);
             }
 
             std::thread::sleep(std::time::Duration::from_millis(10));
