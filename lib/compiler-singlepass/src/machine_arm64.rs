@@ -15,7 +15,8 @@ use wasmer_compiler::{
     wasmparser::MemArg,
 };
 use wasmer_types::{
-    CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode, TrapInformation, VMOffsets,
+    CompilationProgressCallback, CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode,
+    TrapInformation, VMOffsets,
     target::{CallingConvention, CpuFeature, Target},
 };
 
@@ -436,6 +437,25 @@ impl MachineARM64 {
         op(&mut self.assembler, sz, src, dest)?;
         if dst != dest && putback {
             self.move_location(sz, dest, dst)?;
+        }
+        for r in temps {
+            self.release_simd(r);
+        }
+        Ok(())
+    }
+    fn emit_relaxed_fcvt(
+        &mut self,
+        src_size: Size,
+        dst_size: Size,
+        src: Location,
+        dst: Location,
+    ) -> Result<(), CompileError> {
+        let mut temps = vec![];
+        let src = self.location_to_neon(src_size, src, &mut temps, ImmType::None, true)?;
+        let dest = self.location_to_neon(dst_size, dst, &mut temps, ImmType::None, false)?;
+        self.assembler.emit_fcvt(src_size, src, dest)?;
+        if dst != dest {
+            self.move_location(dst_size, dest, dst)?;
         }
         for r in temps {
             self.release_simd(r);
@@ -3279,7 +3299,7 @@ impl Machine for MachineARM64 {
             target_addr,
             memarg,
             false,
-            4,
+            1,
             need_check,
             imported_memories,
             offset,
@@ -3304,7 +3324,7 @@ impl Machine for MachineARM64 {
             target_addr,
             memarg,
             false,
-            4,
+            2,
             need_check,
             imported_memories,
             offset,
@@ -4749,7 +4769,7 @@ impl Machine for MachineARM64 {
         let dest = self.location_to_reg(Size::S64, ret, &mut temps, ImmType::None, false, None)?;
 
         self.assembler
-            .emit_cbz_label(Size::S64, src2, integer_division_by_zero)?;
+            .emit_cbz_label_far(Size::S64, src2, integer_division_by_zero)?;
         let offset = self.mark_instruction_with_trap_code(TrapCode::IntegerOverflow);
         self.assembler.emit_udiv(Size::S64, src1, src2, dest)?;
         if ret != dest {
@@ -7786,11 +7806,11 @@ impl Machine for MachineARM64 {
     }
 
     fn convert_f64_f32(&mut self, loc: Location, ret: Location) -> Result<(), CompileError> {
-        self.emit_relaxed_binop_neon(Assembler::emit_fcvt, Size::S32, loc, ret, true)
+        self.emit_relaxed_fcvt(Size::S32, Size::S64, loc, ret)
     }
 
     fn convert_f32_f64(&mut self, loc: Location, ret: Location) -> Result<(), CompileError> {
-        self.emit_relaxed_binop_neon(Assembler::emit_fcvt, Size::S64, loc, ret, true)
+        self.emit_relaxed_fcvt(Size::S64, Size::S32, loc, ret)
     }
 
     fn f64_neg(&mut self, loc: Location, ret: Location) -> Result<(), CompileError> {
@@ -8371,8 +8391,9 @@ impl Machine for MachineARM64 {
         &self,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<FunctionBody, CompileError> {
-        gen_std_trampoline_arm64(sig, calling_convention)
+        gen_std_trampoline_arm64(sig, calling_convention, progress_callback)
     }
     // Generates dynamic import function call trampoline for a function type.
 
@@ -8381,8 +8402,14 @@ impl Machine for MachineARM64 {
         vmoffsets: &VMOffsets,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<FunctionBody, CompileError> {
-        gen_std_dynamic_import_trampoline_arm64(vmoffsets, sig, calling_convention)
+        gen_std_dynamic_import_trampoline_arm64(
+            vmoffsets,
+            sig,
+            calling_convention,
+            progress_callback,
+        )
     }
     // Singlepass calls import functions through a trampoline.
 
@@ -8392,8 +8419,15 @@ impl Machine for MachineARM64 {
         index: FunctionIndex,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<CustomSection, CompileError> {
-        gen_import_call_trampoline_arm64(vmoffsets, index, sig, calling_convention)
+        gen_import_call_trampoline_arm64(
+            vmoffsets,
+            index,
+            sig,
+            calling_convention,
+            progress_callback,
+        )
     }
 
     #[cfg(feature = "unwind")]

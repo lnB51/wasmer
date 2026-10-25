@@ -14,7 +14,7 @@ version.workspace = true
 
 [dependencies]
 dashmap.workspace = true
-wasmer-types = { path = "../types", version = "=7.3.0" }
+wasmer-types = { path = "../types", version = "=7.5.0" }
 libc.workspace = true
 indexmap.workspace = true
 thiserror.workspace = true
@@ -48,10 +48,6 @@ windows-sys = { workspace = true, features = [
   "Win32_System_Kernel",
   "Win32_System_Memory",
 ] }
-
-[build-dependencies]
-cc.workspace = true
-rustversion.workspace = true
 
 [badges]
 maintenance = { status = "actively-developed" }

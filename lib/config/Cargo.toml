@@ -1,6 +1,6 @@
 [package]
 name = "wasmer-config"
-version = "0.703.0"
+version = "0.705.0"
 description = "Configuration types for Wasmer."
 edition.workspace = true
 license.workspace = true
@@ -15,7 +15,7 @@ categories = ["parser-implementations", "wasm"]
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+yaml_serde.workspace = true
 anyhow.workspace = true
 toml.workspace = true
 thiserror.workspace = true

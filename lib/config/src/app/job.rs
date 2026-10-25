@@ -14,8 +14,8 @@ use super::{AppConfigCapabilityMemoryV1, AppVolume, HttpRequest, pretty_duration
     serde::Serialize, serde::Deserialize, schemars::JsonSchema, Clone, Debug, PartialEq, Eq,
 )]
 pub struct Job {
-    name: String,
-    trigger: JobTrigger,
+    pub name: String,
+    pub trigger: JobTrigger,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<PrettyDuration>,
@@ -55,7 +55,7 @@ pub struct Job {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jitter_percent_min: Option<u8>,
 
-    action: JobAction,
+    pub action: JobAction,
 
     /// Additional unknown fields.
     ///
@@ -68,12 +68,55 @@ pub struct Job {
 // job:
 //   action:
 //     execute: ...
-#[derive(
-    serde::Serialize, serde::Deserialize, schemars::JsonSchema, Clone, Debug, PartialEq, Eq,
-)]
+#[derive(serde::Serialize, schemars::JsonSchema, Clone, Debug, PartialEq, Eq)]
 pub struct JobAction {
     #[serde(flatten)]
-    action: JobActionCase,
+    pub action: JobActionCase,
+}
+
+impl From<JobActionCase> for JobAction {
+    fn from(action: JobActionCase) -> Self {
+        Self { action }
+    }
+}
+
+impl<'de> Deserialize<'de> for JobAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Repr {
+            #[serde(default)]
+            fetch: Option<HttpRequest>,
+            #[serde(default)]
+            execute: Option<ExecutableJob>,
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr {
+                fetch: Some(_),
+                execute: Some(_),
+            } => Err(D::Error::custom(
+                "job action must set exactly one of 'fetch' or 'execute', not both",
+            )),
+            Repr {
+                fetch: Some(fetch),
+                execute: None,
+            } => Ok(JobActionCase::Fetch(fetch).into()),
+            Repr {
+                fetch: None,
+                execute: Some(execute),
+            } => Ok(JobActionCase::Execute(execute).into()),
+            Repr {
+                fetch: None,
+                execute: None,
+            } => Err(D::Error::custom(
+                "job action must set one of 'fetch' or 'execute'",
+            )),
+        }
+    }
 }
 
 #[derive(
@@ -106,16 +149,16 @@ pub enum JobTrigger {
 pub struct ExecutableJob {
     /// The package that contains the command to run. Defaults to the app config's package.
     #[serde(skip_serializing_if = "Option::is_none")]
-    package: Option<PackageSource>,
+    pub package: Option<PackageSource>,
 
     /// The command to run. Defaults to the package's entrypoint.
     #[serde(skip_serializing_if = "Option::is_none")]
-    command: Option<String>,
+    pub command: Option<String>,
 
     /// CLI arguments passed to the runner.
     /// Only applicable for runners that accept CLI arguments.
     #[serde(skip_serializing_if = "Option::is_none")]
-    cli_args: Option<Vec<String>>,
+    pub cli_args: Option<Vec<String>>,
 
     /// Environment variables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -262,6 +305,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn job_action_rejects_anything_but_exactly_one_action() {
+        for yaml in ["execute: {}\nfetch:\n  path: /", "{}", "sleep: {}"] {
+            assert!(
+                yaml_serde::from_str::<JobAction>(yaml).is_err(),
+                "accepted invalid action {yaml:?}"
+            );
+            let json: serde_json::Value = yaml_serde::from_str(yaml).unwrap();
+            assert!(serde_json::from_value::<JobAction>(json).is_err());
+        }
+    }
+
+    #[test]
+    fn job_action_serialization_roundtrip() {
+        for yaml in [
+            "execute:\n  command: php",
+            "fetch:\n  path: /\n  timeout: 30s",
+        ] {
+            let action: JobAction = yaml_serde::from_str(yaml).unwrap();
+            assert_eq!(yaml_serde::to_string(&action).unwrap().trim(), yaml);
+
+            let json: serde_json::Value = yaml_serde::from_str(yaml).unwrap();
+            assert_eq!(
+                serde_json::from_value::<JobAction>(json.clone()).unwrap(),
+                action
+            );
+            assert_eq!(serde_json::to_value(action).unwrap(), json);
+        }
+    }
+
+    #[test]
     pub fn job_trigger_serialization_roundtrip() {
         fn assert_roundtrip(
             serialized: &str,
@@ -388,8 +461,8 @@ action:
 
         assert_eq!(
             serialized.trim(),
-            serde_yaml::to_string(&job).unwrap().trim()
+            yaml_serde::to_string(&job).unwrap().trim()
         );
-        assert_eq!(job, serde_yaml::from_str(serialized).unwrap());
+        assert_eq!(job, yaml_serde::from_str(serialized).unwrap());
     }
 }

@@ -21,8 +21,8 @@ use crate::{
     bin_factory::{BinFactory, BinaryPackage},
     capabilities::Capabilities,
     fs::{WasiFs, WasiFsRoot, WasiInodes},
-    os::command::VirtualCommand,
     os::task::control_plane::{ControlPlaneConfig, ControlPlaneError, WasiControlPlane},
+    os::{TtyBridge, command::VirtualCommand},
     state::WasiState,
     syscalls::types::{__WASI_STDERR_FILENO, __WASI_STDIN_FILENO, __WASI_STDOUT_FILENO},
 };
@@ -70,6 +70,7 @@ pub struct WasiEnvBuilder {
     pub(super) fs: Option<WasiFsRoot>,
     pub(super) engine: Option<Engine>,
     pub(super) runtime: Option<Arc<dyn crate::Runtime + Send + Sync + 'static>>,
+    pub(super) tty: Option<Arc<dyn TtyBridge + Send + Sync + 'static>>,
     pub(super) current_dir: Option<PathBuf>,
 
     /// List of webc dependencies to be injected.
@@ -213,10 +214,17 @@ impl WasiEnvBuilder {
         Key: AsRef<[u8]>,
         Value: AsRef<[u8]>,
     {
-        self.envs.push((
-            String::from_utf8_lossy(key.as_ref()).to_string(),
-            value.as_ref().to_vec(),
-        ));
+        let key = String::from_utf8_lossy(key.as_ref()).to_string();
+        let value = value.as_ref().to_vec();
+        if let Some((_, existing_value)) = self
+            .envs
+            .iter_mut()
+            .find(|(existing_key, _)| existing_key == &key)
+        {
+            *existing_value = value;
+        } else {
+            self.envs.push((key, value));
+        }
     }
 
     /// Add multiple environment variable pairs.
@@ -822,6 +830,17 @@ impl WasiEnvBuilder {
         self.runtime = Some(runtime);
     }
 
+    /// Override the terminal bridge for this process tree.
+    pub fn tty(mut self, tty: Arc<dyn TtyBridge + Send + Sync>) -> Self {
+        self.tty = Some(tty);
+        self
+    }
+
+    /// Override the terminal bridge for this process tree.
+    pub fn set_tty(&mut self, tty: Arc<dyn TtyBridge + Send + Sync>) {
+        self.tty = Some(tty);
+    }
+
     pub fn capabilities(mut self, capabilities: Capabilities) -> Self {
         self.set_capabilities(capabilities);
         self
@@ -1004,6 +1023,7 @@ impl WasiEnvBuilder {
             clock_offset: Default::default(),
             envs: std::sync::Mutex::new(conv_env_vars(self.envs)),
             signals: std::sync::Mutex::new(self.signals.iter().map(|s| (s.sig, s.disp)).collect()),
+            signal_handler_registered: std::sync::atomic::AtomicBool::new(false),
         };
 
         let runtime = self.runtime.unwrap_or_else(|| {
@@ -1066,6 +1086,7 @@ impl WasiEnvBuilder {
         let init = WasiEnvInit {
             state,
             runtime,
+            tty: self.tty,
             webc_dependencies: uses,
             mapped_commands: map_commands,
             control_plane,
@@ -1298,6 +1319,22 @@ mod test {
         {
             None
         }
+    }
+
+    #[test]
+    fn duplicate_environment_variables_use_the_last_value() {
+        let mut builder = WasiEnvBuilder::new("test");
+        builder.add_env("PORT", "5000");
+        builder.add_env("OTHER", "value");
+        builder.add_env("PORT", "8080");
+
+        assert_eq!(
+            builder.get_env(),
+            [
+                ("PORT".to_owned(), b"8080".to_vec()),
+                ("OTHER".to_owned(), b"value".to_vec()),
+            ]
+        );
     }
 
     #[derive(Debug)]

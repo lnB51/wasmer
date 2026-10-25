@@ -2,7 +2,9 @@
 
 ## Installing Rustup
 
-Wasmer supports building with the latest **3** stable releases of Rust.
+Wasmer supports building to the latest **3** stable releases, but pins
+to one specific one at the time. `rustup` selects it automatically. See
+[rust-toolchain.toml](../rust-toolchain.toml) for the current pin.
 The easiest way to install Rust on your system is via [Rustup](https://rustup.rs/). To get Rustup on Linux and macOS, you can run the following:
 
 ```bash
@@ -18,17 +20,17 @@ curl https://sh.rustup.rs -sSf | sh
 
 Linux is fully supported by Wasmer. WASI(x) is also fully supported. Users
 building from source can enable the LLVM backend following the instruction in
-the dedicated section below and installing LLVM version 22. To install it,
+the dedicated section below and installing LLVM version 23. To install it,
 refer to [LLVM's download
-page](https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.1) or
+page](https://github.com/llvm/llvm-project/releases/tag/llvmorg-23.1.1) or
 check your distro's package manager.
 
 ### macOS
 
 macOS is fully supported by Wasmer. WASI(x) is also fully supported. Users
 building from source can enable the LLVM backend following the instruction in
-the dedicated section below and installing LLVM version 22. To install it on
-macOS, you can use [homebrew](https://brew.sh/): `brew install llvm@22`.
+the dedicated section below and installing LLVM version 23. To install it on
+macOS, you can use [homebrew](https://brew.sh/): `brew install llvm@23`.
 
 ### Windows
 
@@ -37,7 +39,7 @@ Windows is fully supported by Wasmer. WASI(x) is also fully supported.
 1. Install [Visual Studio](https://visualstudio.microsoft.com/thank-you-downloading-visual-studio/?sku=Community&rel=15)
 2. Install [Rust for Windows](https://win.rustup.rs/)
 3. Install [Git for Windows](https://git-scm.com/download/win). Allow it to add `git.exe` to your PATH (default settings for the installer are fine).
-4. \(optional\) Install [LLVM 22.1](https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.1/LLVM-22.1.1-win64.exe)
+4. \(optional\) Install [LLVM 23.1](https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/LLVM-23.1.1-win64.exe)
 
 ## Building the Wasmer Runtime
 
@@ -53,6 +55,9 @@ First, let's clone Wasmer along with its submodules:
 git clone --recursive https://github.com/wasmerio/wasmer.git
 cd wasmer
 ```
+
+In an existing clone, initialize the submodules with
+`git submodule update --init --recursive`.
 
 Wasmer supports different backends at the moment: `singlepass`, `cranelift`, `LLVM` and `V8`.
 
@@ -94,12 +99,15 @@ variable, and force its enabling with `ENABLE_CRANELIFT=1`.
 
 If you want support for the Wasmer LLVM compiler, then you will also need to:
 
-- Ensure that LLVM >=22.1.x is installed on your system
+- Ensure that LLVM 23 (>=23.1.x) is installed on your system. The backend
+  needs LLVM 23 exactly; any other version silently disables it — read the
+  `Enabled Compilers:` banner. The error `Didn't find usable system-wide
+  LLVM` means LLVM 23 is missing.
   - You can refer to [LLVM install instructions](https://github.com/wasmerio/wasmer/tree/master/lib/compiler-llvm#requirements)
   - You can also [download and use a prebuilt LLVM binary](https://releases.llvm.org/download.html)
-- In case `llvm-config` is not accessible, set the correct environment variable
-  for LLVM to access: For example, the environment variable for LLVM 22.1.x
-  would be: `LLVM_SYS_221_PREFIX=/path/to/unpacked/llvm-22.1`
+- In case `llvm-config-23` is not on PATH, set the correct environment variable
+  for LLVM to access: For example, the environment variable for LLVM 23.1.x
+  would be: `LLVM_SYS_231_PREFIX=/path/to/unpacked/llvm-23.1`
 
 And create a Wasmer release
 
@@ -125,7 +133,7 @@ Wasmer can run on.
 ENABLE_V8=1 make build-wasmer
 ```
 
-### All compilers
+### All Compilers
 
 Once you have LLVM and Rust, you can just run:
 
@@ -136,7 +144,29 @@ make build-wasmer
 **Note**: you should see this in the console:  
 `Enabled Compilers: singlepass cranelift llvm`
 
-## Running your Wasmer binary
+## Iterating During Development
+
+For fast iteration, run `make check`, or build one crate:
+
+```bash
+cargo build -p wasmer-cli --features cranelift
+```
+
+`make build-wasmer-debug` builds a debug binary with tokio-console support.
+
+Read the `Enabled Compilers:` banner that each make target prints. The
+Makefile silently omits backends it cannot detect. V8 is never
+autodetected.
+
+The wasix-libc sysroot and Rust toolchain pins for CI live in
+`.github/ci-constants.env`.
+
+> [!CAUTION]
+> Do not build with `cargo build --workspace --features <backend>`.
+> Workspace-level features do not reach subcrates. The result is a headless
+> binary that cannot compile Wasm. Use `-p wasmer-cli` or the Makefile.
+
+## Running Your Wasmer Binary
 
 Once you run the `make build-wasmer` command, you will have a new binary ready to be used!
 
@@ -144,7 +174,7 @@ Once you run the `make build-wasmer` command, you will have a new binary ready t
 ./target/release/wasmer quickjs.wasm
 ```
 
-## Building Wasmer C-API from source
+## Building Wasmer C-API from Source
 
 Wasmer provides a pre-compiled version for the C-API on its [release page](https://github.com/wasmerio/wasmer/releases).
 

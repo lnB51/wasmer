@@ -29,7 +29,7 @@ use wasmer_config::{
     app::AppConfigV1,
     package::{PackageIdent, PackageSource},
 };
-use wasmer_sdk::app::deploy_remote_build::{
+use wasmer_package_sdk::app::deploy_remote_build::{
     DeployRemoteEvent, DeployRemoteOpts, deploy_app_remote,
 };
 
@@ -66,6 +66,10 @@ pub struct CmdAppDeploy {
     /// The path to the `app.yaml` file.
     #[clap(long, conflicts_with = "dir")]
     pub path: Option<PathBuf>,
+
+    /// Load environment variables from a dotenv file for this deployment.
+    #[clap(long = "env-file", name = "PATH")]
+    pub env_file: Option<PathBuf>,
 
     /// Do not wait for the app to become reachable.
     #[clap(long)]
@@ -144,7 +148,7 @@ pub struct CmdAppDeploy {
 struct RemoteBuildInput {
     app_config: AppConfigV1,
     owner: String,
-    original_config: Option<serde_yaml::Value>,
+    original_config: Option<yaml_serde::Value>,
     config_path: Option<PathBuf>,
 }
 
@@ -189,14 +193,14 @@ impl CmdAppDeploy {
     async fn get_owner(
         &self,
         client: &WasmerClient,
-        app: &mut serde_yaml::Value,
+        app: &mut yaml_serde::Value,
         maybe_edge_app: Option<&DeployApp>,
     ) -> anyhow::Result<String> {
         if let Some(owner) = &self.owner {
             return Ok(owner.clone());
         }
 
-        if let Some(serde_yaml::Value::String(owner)) = &app.get("owner") {
+        if let Some(yaml_serde::Value::String(owner)) = &app.get("owner") {
             return Ok(owner.clone());
         }
 
@@ -292,15 +296,20 @@ impl CmdAppDeploy {
         };
 
         let RemoteBuildInput {
-            app_config,
+            mut app_config,
             owner,
             original_config,
             config_path,
         } = prep;
+        let persisted_app_config = app_config.clone();
+        if let Some(path) = &self.env_file {
+            apply_env_file(&mut app_config, path)?;
+        }
 
         let opts = DeployAppOpts {
             app: &app_config,
             original_config: original_config.clone(),
+            env_file: None,
             allow_create: true,
             make_default: !self.no_default,
             owner: Some(owner.clone()),
@@ -325,11 +334,14 @@ impl CmdAppDeploy {
                 new_app_config.app_id = None;
             }
 
-            new_app_config.package = app_config.package.clone();
+            new_app_config.package = persisted_app_config.package.clone();
+            // An env file applies only to this deployment and must not be
+            // written back into app.yaml.
+            new_app_config.env = persisted_app_config.env.clone();
 
-            if new_app_config != app_config {
+            if new_app_config != persisted_app_config {
                 let new_merged = crate::utils::merge_yaml_values(
-                    &app_config.clone().to_yaml_value()?,
+                    &persisted_app_config.clone().to_yaml_value()?,
                     &new_app_config.to_yaml_value()?,
                 );
                 let new_config_raw =
@@ -357,7 +369,7 @@ impl CmdAppDeploy {
         let config_str = std::fs::read_to_string(app_config_path)
             .with_context(|| format!("Could not read file '{}'", app_config_path.display()))?;
 
-        let mut app_yaml: serde_yaml::Value = serde_yaml::from_str(&config_str)?;
+        let mut app_yaml: yaml_serde::Value = yaml_serde::from_str(&config_str)?;
         let maybe_edge_app = if let Some(app_id) = app_yaml.get("app_id").and_then(|s| s.as_str()) {
             wasmer_backend_api::query::get_app_by_id(client, app_id.to_owned())
                 .await
@@ -419,7 +431,7 @@ impl CmdAppDeploy {
             }
         }
 
-        let current_config: AppConfigV1 = serde_yaml::from_value(app_yaml.clone())?;
+        let current_config: AppConfigV1 = yaml_serde::from_value(app_yaml.clone())?;
         let new_config_raw = crate::utils::yaml::apply_app_config_to_yaml(
             &config_str,
             &current_config.clone().to_yaml_value()?,
@@ -623,7 +635,7 @@ impl AsyncCliCommand for CmdAppDeploy {
             .with_context(|| format!("Could not read file '{}'", &app_config_path.display()))?;
 
         // We want to allow the user to specify the app name interactively.
-        let mut app_yaml: serde_yaml::Value = serde_yaml::from_str(&config_str)?;
+        let mut app_yaml: yaml_serde::Value = yaml_serde::from_str(&config_str)?;
         let maybe_edge_app = if let Some(app_id) = app_yaml.get("app_id").and_then(|s| s.as_str()) {
             wasmer_backend_api::query::get_app_by_id(&client, app_id.to_owned())
                 .await
@@ -716,7 +728,7 @@ impl AsyncCliCommand for CmdAppDeploy {
             }
         }
 
-        let original_app_config: AppConfigV1 = serde_yaml::from_value(app_yaml.clone())?;
+        let original_app_config: AppConfigV1 = yaml_serde::from_value(app_yaml.clone())?;
         let new_config_raw = crate::utils::yaml::apply_app_config_to_yaml(
             &config_str,
             &original_app_config.clone().to_yaml_value()?,
@@ -793,6 +805,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                 DeployAppOpts {
                     app: &app_cfg_new,
                     original_config: Some(app_config.clone().to_yaml_value().unwrap()),
+                    env_file: self.env_file.clone(),
                     allow_create: true,
                     make_default: !self.no_default,
                     owner: Some(owner),
@@ -865,6 +878,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                                         original_config: Some(
                                             app_config.clone().to_yaml_value().unwrap(),
                                         ),
+                                        env_file: self.env_file.clone(),
                                         allow_create: true,
                                         make_default: !self.no_default,
                                         owner: Some(owner),
@@ -882,6 +896,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                                         original_config: Some(
                                             app_config.clone().to_yaml_value().unwrap(),
                                         ),
+                                        env_file: self.env_file.clone(),
                                         allow_create: true,
                                         make_default: !self.no_default,
                                         owner: Some(owner),
@@ -894,6 +909,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                                     original_config: Some(
                                         app_config.clone().to_yaml_value().unwrap(),
                                     ),
+                                    env_file: self.env_file.clone(),
                                     allow_create: true,
                                     make_default: !self.no_default,
                                     owner: Some(owner),
@@ -904,6 +920,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                             DeployAppOpts {
                                 app: &app_config,
                                 original_config: Some(app_config.clone().to_yaml_value().unwrap()),
+                                env_file: self.env_file.clone(),
                                 allow_create: true,
                                 make_default: !self.no_default,
                                 owner: Some(owner),
@@ -914,6 +931,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                         DeployAppOpts {
                             app: &app_config,
                             original_config: Some(app_config.clone().to_yaml_value().unwrap()),
+                            env_file: self.env_file.clone(),
                             allow_create: true,
                             make_default: !self.no_default,
                             owner: Some(owner),
@@ -925,6 +943,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                     DeployAppOpts {
                         app: &app_config,
                         original_config: Some(app_config.clone().to_yaml_value().unwrap()),
+                        env_file: self.env_file.clone(),
                         allow_create: true,
                         make_default: !self.no_default,
                         owner: Some(owner),
@@ -937,6 +956,7 @@ impl AsyncCliCommand for CmdAppDeploy {
                 DeployAppOpts {
                     app: &app_config,
                     original_config: Some(app_config.clone().to_yaml_value().unwrap()),
+                    env_file: self.env_file.clone(),
                     allow_create: true,
                     make_default: !self.no_default,
                     owner: Some(owner),
@@ -979,6 +999,9 @@ impl AsyncCliCommand for CmdAppDeploy {
 
         // Don't override the package field.
         new_app_config.package = app_config.package.clone();
+        // An env file applies only to this deployment and must not be written
+        // back into app.yaml.
+        new_app_config.env = app_config.env.clone();
         // [TODO]: check if name was added...
 
         // If the config changed, write it back.
@@ -1013,7 +1036,9 @@ pub struct DeployAppOpts<'a> {
     // Original raw yaml config.
     // Present here to enable forwarding unknown fields to the backend, which
     // preserves forwards-compatibility for schema changes.
-    pub original_config: Option<serde_yaml::value::Value>,
+    pub original_config: Option<yaml_serde::value::Value>,
+    /// Optional dotenv file overlaid on the app configuration for deployment.
+    pub env_file: Option<PathBuf>,
     #[allow(dead_code)]
     pub allow_create: bool,
     pub make_default: bool,
@@ -1086,19 +1111,35 @@ fn remote_progress_handler(quiet: bool) -> impl FnMut(DeployRemoteEvent) {
     }
 }
 
+fn apply_env_file(app: &mut AppConfigV1, path: &Path) -> anyhow::Result<()> {
+    let entries = dotenvy::from_path_iter(path)
+        .with_context(|| format!("Could not read env file '{}'", path.display()))?;
+    for entry in entries {
+        let (key, value) =
+            entry.with_context(|| format!("Could not parse env file '{}'", path.display()))?;
+        app.env.insert(key, value);
+    }
+    Ok(())
+}
+
 pub async fn deploy_app(
     client: &WasmerClient,
     opts: DeployAppOpts<'_>,
 ) -> Result<DeployAppVersion, anyhow::Error> {
-    let app = opts.app;
+    let mut app = opts.app.clone();
 
-    let config_value = app.clone().to_yaml_value()?;
+    if let Some(path) = &opts.env_file {
+        apply_env_file(&mut app, path)?;
+    }
+
+    let name = app.name.clone().context("Expected an app name")?;
+    let config_value = app.to_yaml_value()?;
     let final_config = if let Some(old) = &opts.original_config {
         crate::utils::merge_yaml_values(old, &config_value)
     } else {
         config_value
     };
-    let mut raw_config = serde_yaml::to_string(&final_config)?.trim().to_string();
+    let mut raw_config = yaml_serde::to_string(&final_config)?.trim().to_string();
     raw_config.push('\n');
 
     // TODO: respect allow_create flag
@@ -1107,7 +1148,7 @@ pub async fn deploy_app(
         client,
         wasmer_backend_api::types::PublishDeployAppVars {
             config: raw_config,
-            name: app.name.clone().context("Expected an app name")?.into(),
+            name: name.into(),
             owner: opts.owner.map(|o| o.into()),
             make_default: Some(opts.make_default),
         },
@@ -1372,8 +1413,39 @@ pub fn app_config_from_api(version: &DeployAppVersion) -> Result<AppConfigV1, an
 
 #[cfg(test)]
 mod tests {
-    use super::format_duration_words;
+    use super::{CmdAppDeploy, apply_env_file, format_duration_words};
+    use crate::commands::app::create::minimal_app_config;
+    use clap::Parser as _;
+    use std::path::PathBuf;
     use time::Duration as TimeDuration;
+
+    #[test]
+    fn env_file_can_be_used_with_remote_build() {
+        let command = CmdAppDeploy::try_parse_from([
+            "wasmer deploy",
+            "--env-file",
+            "deploy.env",
+            "--build-remote",
+        ])
+        .unwrap();
+
+        assert_eq!(command.env_file, Some(PathBuf::from("deploy.env")));
+        assert!(command.build_remote);
+    }
+
+    #[test]
+    fn env_file_is_overlaid_on_deployment_config() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("deploy.env");
+        std::fs::write(&path, "FROM_FILE=yes\nSHARED=file\n").unwrap();
+        let mut app = minimal_app_config("owner", "name");
+        app.env.insert("SHARED".to_owned(), "app-yaml".to_owned());
+
+        apply_env_file(&mut app, &path).unwrap();
+
+        assert_eq!(app.env.get("FROM_FILE").map(String::as_str), Some("yes"));
+        assert_eq!(app.env.get("SHARED").map(String::as_str), Some("file"));
+    }
 
     #[test]
     fn format_duration_words_seconds() {

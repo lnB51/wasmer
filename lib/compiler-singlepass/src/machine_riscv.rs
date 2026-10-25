@@ -16,7 +16,8 @@ use wasmer_compiler::{
     wasmparser::MemArg,
 };
 use wasmer_types::{
-    CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode, TrapInformation, VMOffsets,
+    CompilationProgressCallback, CompileError, FunctionIndex, FunctionType, SourceLoc, TrapCode,
+    TrapInformation, VMOffsets,
     target::{CallingConvention, Target},
 };
 
@@ -472,10 +473,9 @@ impl MachineRiscv {
                         )?;
                         self.assembler
                             .emit_reserved_sd(Size::S32, tmp, aligned_addr, tmp)?;
-                        let tmp2 = self.acquire_temp_gpr().ok_or_else(|| {
-                            CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
-                        })?;
-                        temps.push(tmp2);
+                        // The following 2 register don't have a liveness intersection, reuse it.
+                        let tmp2 = addr;
+
                         self.assembler
                             .emit_on_true_label(Location::GPR(tmp), label_retry, tmp2)?;
 
@@ -628,10 +628,8 @@ impl MachineRiscv {
                 self.assembler.emit_mov(size, Location::GPR(value), dst)?;
             }
             Size::S8 | Size::S16 => {
-                let value = self.acquire_temp_gpr().ok_or_else(|| {
-                    CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
-                })?;
-                temps.push(value);
+                // We're tight with the number of available registers.
+                let value = SCRATCH_REG;
                 let tmp = self.acquire_temp_gpr().ok_or_else(|| {
                     CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
                 })?;
@@ -644,10 +642,6 @@ impl MachineRiscv {
                     CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
                 })?;
                 temps.push(bit_mask);
-                let cond = self.acquire_temp_gpr().ok_or_else(|| {
-                    CompileError::Codegen("singlepass cannot acquire temp gpr".to_owned())
-                })?;
-                temps.push(cond);
 
                 // before the loop
                 self.assembler.emit_and(
@@ -713,6 +707,9 @@ impl MachineRiscv {
                     Location::GPR(bit_mask),
                     Location::GPR(tmp),
                 )?;
+
+                // The following 2 register don't have a liveness intersection, reuse it.
+                let cond = tmp;
 
                 self.assembler.emit_cmp(
                     Condition::Eq,
@@ -6530,8 +6527,9 @@ impl Machine for MachineRiscv {
         &self,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<FunctionBody, CompileError> {
-        gen_std_trampoline_riscv(sig, calling_convention)
+        gen_std_trampoline_riscv(sig, calling_convention, progress_callback)
     }
 
     fn gen_std_dynamic_import_trampoline(
@@ -6539,8 +6537,9 @@ impl Machine for MachineRiscv {
         vmoffsets: &VMOffsets,
         sig: &FunctionType,
         _calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<FunctionBody, CompileError> {
-        gen_std_dynamic_import_trampoline_riscv(vmoffsets, sig)
+        gen_std_dynamic_import_trampoline_riscv(vmoffsets, sig, progress_callback)
     }
     // Singlepass calls import functions through a trampoline.
 
@@ -6550,8 +6549,15 @@ impl Machine for MachineRiscv {
         index: FunctionIndex,
         sig: &FunctionType,
         calling_convention: CallingConvention,
+        progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<CustomSection, CompileError> {
-        gen_import_call_trampoline_riscv(vmoffsets, index, sig, calling_convention)
+        gen_import_call_trampoline_riscv(
+            vmoffsets,
+            index,
+            sig,
+            calling_convention,
+            progress_callback,
+        )
     }
 
     #[cfg(feature = "unwind")]

@@ -74,6 +74,10 @@ impl SinglepassCompiler {
         function_body_inputs: PrimaryMap<LocalFunctionIndex, FunctionBodyData<'_>>,
         progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<Compilation, CompileError> {
+        wasmer_compiler::validate_module_fixed_table_size(
+            &compile_info.module,
+            self.config.max_table_elements,
+        )?;
         let arch = target.triple().architecture;
         match arch {
             Architecture::X86_64 => {}
@@ -143,7 +147,8 @@ impl SinglepassCompiler {
 
         let memory_styles = &compile_info.memory_styles;
         let table_styles = &compile_info.table_styles;
-        let vmoffsets = VMOffsets::new(8, &compile_info.module);
+        let vmoffsets =
+            VMOffsets::try_new(8, &compile_info.module).map_err(CompileError::Resource)?;
         let module = &compile_info.module;
         let import_trampolines = (0..module.num_imported_functions)
             .map(FunctionIndex::new)
@@ -157,6 +162,7 @@ impl SinglepassCompiler {
                     target,
                     calling_convention,
                     self.config.experimental_artifact,
+                    progress_callback,
                 )
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
@@ -196,6 +202,7 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            progress_callback,
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
@@ -217,6 +224,7 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            progress_callback,
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
@@ -241,6 +249,7 @@ impl SinglepassCompiler {
                             &locals,
                             machine,
                             calling_convention,
+                            progress_callback,
                         )?;
                         while generator.has_control_frames() {
                             generator.set_srcloc(reader.original_position() as u32);
@@ -282,6 +291,7 @@ impl SinglepassCompiler {
                         target,
                         calling_convention,
                         self.config.experimental_artifact.then_some(&kind),
+                        progress_callback,
                     )?;
                     if let Some(callbacks) = self.config.callbacks.as_ref()
                         && let CompileOutput::InMemory(body) = &body
@@ -321,6 +331,7 @@ impl SinglepassCompiler {
                         target,
                         calling_convention,
                         self.config.experimental_artifact.then_some(&kind),
+                        progress_callback,
                     )?;
                     if let Some(callbacks) = self.config.callbacks.as_ref()
                         && let CompileOutput::InMemory(body) = &body
@@ -394,6 +405,9 @@ impl SinglepassCompiler {
             eh_frame.write(&[0, 0, 0, 0]).unwrap(); // Write a 0 length at the end of the table.
 
             let eh_frame_section = eh_frame.0.into_section();
+            if let Some(progress_callback) = progress_callback.as_ref() {
+                progress_callback.reserve_size(eh_frame_section.bytes.len())?;
+            }
             custom_sections.push(eh_frame_section);
             unwind_info.eh_frame = Some(SectionIndex::new(custom_sections.len() - 1))
         };

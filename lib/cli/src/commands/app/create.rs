@@ -688,7 +688,7 @@ impl CmdAppCreate {
                 .by_index(entry)
                 .context(format!("Getting the archive entry #{entry}"))?;
 
-            let path = entry.mangled_name();
+            let path = entry.mangled_name()?;
 
             // We skip the top-level directory, as Github archives always contain a top-level directory
             // named after the repository name and latest commit hash.
@@ -742,9 +742,9 @@ impl CmdAppCreate {
 
         if app_yaml_path.exists() && app_yaml_path.is_file() {
             let contents = tokio::fs::read_to_string(&app_yaml_path).await?;
-            let mut raw_yaml: serde_yaml::Value = serde_yaml::from_str(&contents)?;
+            let mut raw_yaml: yaml_serde::Value = yaml_serde::from_str(&contents)?;
 
-            if let serde_yaml::Value::Mapping(m) = &mut raw_yaml {
+            if let yaml_serde::Value::Mapping(m) = &mut raw_yaml {
                 m.insert("name".into(), app_name.into());
                 m.insert("owner".into(), owner.into());
                 m.shift_remove("domains");
@@ -827,6 +827,7 @@ the app:\n"
                 publish_package: !build_remote,
                 dir: self.app_dir_path.clone(),
                 path: path.map(|v| v.to_path_buf()),
+                env_file: None,
                 no_wait: self.no_wait,
                 no_default: false,
                 no_persist_id: false,

@@ -42,7 +42,7 @@ jobs:
           target: x86_64-unknown-linux-gnu
           components: rustc,cargo,rust-std,rust-src,clippy,rustfmt,rust-analyzer,rust-docs
       - name: Cache dependencies
-        uses: actions/cache@v4
+        uses: runs-on/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -60,17 +60,16 @@ jobs:
         shell: bash
         run: |
           cd $HOME
-          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf ${{ env.LLVM_URL }} -L -o llvm.tar.xz
           LLVM_DIR=$HOME/.llvm
           mkdir ${LLVM_DIR}
-          tar xf llvm.tar.xz --strip-components=1 -C ${LLVM_DIR}
+          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf "${{ env.LLVM_URL }}" -L -o - | tar --zstd -xvf - --strip-components=1 -C ${LLVM_DIR}
           echo "${LLVM_DIR}/bin" >> $GITHUB_PATH
           echo "${LLVM_DIR}/usr/bin" >> $GITHUB_PATH
-          echo "LLVM_SYS_221_PREFIX=${LLVM_DIR}" >> $GITHUB_ENV
+          echo "LLVM_SYS_231_PREFIX=${LLVM_DIR}" >> $GITHUB_ENV
           echo "ENABLE_LLVM=1" >> $GITHUB_ENV
           cd -
         env:
-          LLVM_URL: https://github.com/wasmerio/llvm-custom-builds/releases/download/22.x/llvm-linux-amd64.tar.xz
+          LLVM_URL: https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-linux-amd64.tar.zst
       - name: Install wasixcc
         uses: wasix-org/wasixcc@v0.4.3
         with:
