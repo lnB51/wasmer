@@ -58,9 +58,32 @@ impl InterestGuard {
         }
     }
 
+    /// A handle that raises interest on this registration from elsewhere (e.g. a timer task)
+    /// without holding the guard. It does nothing once the registration is gone.
+    pub fn notifier(&self) -> InterestNotifier {
+        InterestNotifier {
+            selector: self.selector.clone(),
+            token: self.token,
+        }
+    }
+
     fn drop_internal(&mut self) {
         if let Some(selector) = self.selector.upgrade() {
             selector.remove(self.token, None).ok();
+        }
+    }
+}
+
+/// Raises interest on a registered source; see [`InterestGuard::notifier`].
+#[derive(Debug, Clone)]
+pub struct InterestNotifier {
+    selector: Weak<Selector>,
+    token: Token,
+}
+impl InterestNotifier {
+    pub fn notify(&self, interest: InterestType) {
+        if let Some(selector) = self.selector.upgrade() {
+            selector.push_interest(self.token, interest);
         }
     }
 }

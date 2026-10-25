@@ -67,6 +67,7 @@ host-net = [
   "virtual-mio/sys",
   "tokio/net",
   "tokio/rt",
+  "tokio/time",
   "socket2",
   "mio",
 ]

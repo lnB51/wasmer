@@ -238,6 +238,26 @@ pub struct InodeSocket {
     pub(crate) inner: Arc<InodeSocketInner>,
 }
 
+/// Waits for a blocking connect to finish and reports how it ended. Host networking starts
+/// the connect without waiting, and writability alone does not mean success: a refused or
+/// timed-out connect is also "ready".
+async fn wait_for_connect(socket: &mut (dyn VirtualTcpSocket + Sync)) -> Result<(), Errno> {
+    futures::future::poll_fn(|cx| socket.poll_write_ready(cx))
+        .await
+        .map_err(net_error_into_wasi_err)?;
+    match socket.status().map_err(net_error_into_wasi_err)? {
+        virtual_net::SocketStatus::Failed | virtual_net::SocketStatus::Closed => {
+            let err = socket
+                .last_error()
+                .map_err(net_error_into_wasi_err)?
+                .map(net_error_into_wasi_err)
+                .unwrap_or(Errno::Connrefused);
+            Err(err)
+        }
+        virtual_net::SocketStatus::Opening | virtual_net::SocketStatus::Opened => Ok(()),
+    }
+}
+
 impl InodeSocket {
     pub fn new(kind: InodeSocketKind) -> Self {
         let protected = InodeSocketProtected { kind };
@@ -742,9 +762,7 @@ impl InodeSocket {
                                     ret.set_dontroute(dont_route).ok();
                                 }
                                 if !nonblocking {
-                                    futures::future::poll_fn(|cx| ret.poll_write_ready(cx))
-                                        .await
-                                        .map_err(net_error_into_wasi_err)?;
+                                    wait_for_connect(ret.as_mut()).await?;
                                 }
                                 Ok(ret)
                             })
@@ -774,9 +792,7 @@ impl InodeSocket {
                             }
                             Box::pin(async move {
                                 if !nonblocking {
-                                    futures::future::poll_fn(|cx| ret.poll_write_ready(cx))
-                                        .await
-                                        .map_err(net_error_into_wasi_err)?;
+                                    wait_for_connect(ret.as_mut()).await?;
                                 }
                                 Ok(ret)
                             })

@@ -27,7 +27,8 @@ use tokio::runtime::Handle;
 #[allow(unused_imports, dead_code)]
 use tracing::{debug, error, info, trace, warn};
 use virtual_mio::{
-    HandlerGuardState, InterestGuard, InterestHandler, InterestType, Selector, state_as_waker_map,
+    HandlerGuardState, InterestGuard, InterestHandler, InterestNotifier, InterestType, Selector,
+    state_as_waker_map,
 };
 
 /// Use the platform's maximum listen backlog where available so that
@@ -259,77 +260,27 @@ impl VirtualNetworking for LocalNetworking {
             return Err(NetworkError::PermissionDenied);
         }
 
+        // Start a non-blocking connect and return at once. sock_connect waits for this future
+        // even for non-blocking guest sockets, so waiting for the handshake here would hold the
+        // calling guest thread (and in practice stall the guest) for up to the connect timeout.
+        // Blocking callers wait in wasix `InodeSocket::connect`; non-blocking ones poll for
+        // writability and read the outcome through `status()` / SO_ERROR.
         let stream = mio::net::TcpStream::connect(peer).map_err(io_err_into_net_error)?;
-
         if let Ok(p) = stream.peer_addr() {
             peer = p;
-            let socket = Box::new(LocalTcpStream::new(self.selector.clone(), stream, peer));
-            return Ok(socket);
+            return Ok(Box::new(LocalTcpStream::new(
+                self.selector.clone(),
+                stream,
+                peer,
+            )));
         }
-
-        let start = std::time::Instant::now();
-        let timeout = self.connect_timeout;
-
-        loop {
-            #[cfg(not(target_os = "windows"))]
-            {
-                if let Some(val) = libc_poll(stream.as_raw_fd(), libc::POLLOUT | libc::POLLHUP) {
-                    if (val & libc::POLLHUP) != 0 {
-                        let sock_err = socket2::SockRef::from(&stream)
-                            .take_error()
-                            .map_err(io_err_into_net_error)?;
-                        if let Some(err) = sock_err {
-                            return Err(io_err_into_net_error(err));
-                        } else {
-                            return Err(NetworkError::IOError);
-                        }
-                    }
-                    if (val & libc::POLLOUT) != 0 {
-                        let sock_err = socket2::SockRef::from(&stream)
-                            .take_error()
-                            .map_err(io_err_into_net_error)?;
-                        if let Some(err) = sock_err {
-                            return Err(io_err_into_net_error(err));
-                        }
-                        if let Ok(p) = stream.peer_addr() {
-                            peer = p;
-                            break;
-                        } else {
-                            return Err(NetworkError::IOError);
-                        }
-                    }
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                if let Ok(p) = stream.peer_addr() {
-                    peer = p;
-                    break;
-                }
-                let sock_err = {
-                    let b = unsafe {
-                        std::os::windows::io::BorrowedSocket::borrow_raw(stream.as_raw_socket())
-                    };
-                    socket2::SockRef::from(&b)
-                        .take_error()
-                        .map_err(io_err_into_net_error)?
-                };
-                if let Some(err) = sock_err {
-                    return Err(io_err_into_net_error(err));
-                }
-            }
-
-            if start.elapsed() > timeout {
-                tracing::debug!(%peer, ?timeout, "connect_tcp timed out");
-                return Err(NetworkError::TimedOut);
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        let socket = Box::new(LocalTcpStream::new(self.selector.clone(), stream, peer));
-        Ok(socket)
+        Ok(Box::new(LocalTcpStream::connecting(
+            self.selector.clone(),
+            stream,
+            peer,
+            std::time::Instant::now() + self.connect_timeout,
+            self.handle.clone(),
+        )))
     }
 
     async fn resolve(
@@ -618,6 +569,19 @@ pub struct LocalTcpStream {
     handler_guard: HandlerGuardState,
     buffer: BytesMut,
     connect_state: Mutex<ConnectState>,
+    /// While an outbound connect is in progress: when it gives up.
+    connect_deadline: Option<std::time::Instant>,
+    /// Who the deadline timer alerts; shared with the timer task.
+    deadline_targets: Option<Arc<Mutex<DeadlineTargets>>>,
+}
+
+/// Waiters on an in-progress connect that the deadline timer must alert: a `poll_write_ready`
+/// caller, and the guest's registered interest handler (wasix epoll / poll_oneoff), which only
+/// learns of readiness through pushed interest.
+#[derive(Debug, Default)]
+struct DeadlineTargets {
+    waker: Option<std::task::Waker>,
+    notifier: Option<InterestNotifier>,
 }
 
 impl LocalTcpStream {
@@ -631,6 +595,8 @@ impl LocalTcpStream {
             handler_guard: HandlerGuardState::None,
             buffer: BytesMut::new(),
             connect_state: Mutex::new(ConnectState::Unknown),
+            connect_deadline: None,
+            deadline_targets: None,
         };
 
         // In windows we can not poll the socket as it is not supported and hence
@@ -646,6 +612,61 @@ impl LocalTcpStream {
         }
 
         ret
+    }
+
+    /// A stream whose non-blocking connect is still in progress. It reports
+    /// [`SocketStatus::Failed`] with [`NetworkError::TimedOut`] once `deadline` passes without
+    /// the handshake completing.
+    fn connecting(
+        selector: Arc<Selector>,
+        stream: mio::net::TcpStream,
+        addr: SocketAddr,
+        deadline: std::time::Instant,
+        handle: Handle,
+    ) -> Self {
+        let mut ret = Self::new(selector, stream, addr);
+        let targets = Arc::new(Mutex::new(DeadlineTargets::default()));
+        ret.connect_deadline = Some(deadline);
+        ret.deadline_targets = Some(targets.clone());
+        // At the deadline, wake whoever waits so they observe the TimedOut status. A connect
+        // that already resolved just sees one spurious writability event.
+        let when = tokio::time::Instant::from_std(deadline);
+        handle.spawn(async move {
+            tokio::time::sleep_until(when).await;
+            let targets = targets.lock().unwrap();
+            if let Some(waker) = &targets.waker {
+                waker.wake_by_ref();
+            }
+            if let Some(notifier) = &targets.notifier {
+                notifier.notify(InterestType::Writable);
+            }
+        });
+        ret
+    }
+
+    /// Whether the in-progress connect ran past its deadline; latches the failure if so.
+    fn connect_timed_out(&self) -> bool {
+        let Some(deadline) = &self.connect_deadline else {
+            return false;
+        };
+        if std::time::Instant::now() < *deadline {
+            return false;
+        }
+        let mut state = self.connect_state.lock().unwrap();
+        match *state {
+            ConnectState::Opened => false,
+            ConnectState::Failed(_) | ConnectState::Reset => true,
+            ConnectState::Unknown => {
+                // The handshake may have finished right at the deadline.
+                if self.stream.peer_addr().is_ok() {
+                    *state = ConnectState::Opened;
+                    false
+                } else {
+                    *state = ConnectState::Failed(NetworkError::TimedOut);
+                    true
+                }
+            }
+        }
     }
 
     fn with_sock_ref<F, R>(&self, f: F) -> R
@@ -839,6 +860,9 @@ impl VirtualSocket for LocalTcpStream {
     }
 
     fn status(&self) -> Result<SocketStatus> {
+        if self.connect_timed_out() {
+            return Ok(SocketStatus::Failed);
+        }
         // `take_error()` consumes the latched socket error, so once the
         // connect resolves we cache the terminal state to keep status() stable.
         let mut connect_state = self.connect_state.lock().unwrap();
@@ -908,6 +932,10 @@ impl VirtualSocket for LocalTcpStream {
         )
         .map_err(io_err_into_net_error)?;
 
+        // A handler registered while connecting must also hear about the connect deadline.
+        if let Some(targets) = &self.deadline_targets {
+            targets.lock().unwrap().notifier = Some(guard.notifier());
+        }
         self.handler_guard = HandlerGuardState::ExternalHandler(guard);
 
         Ok(())
@@ -977,32 +1005,53 @@ impl VirtualIoSource for LocalTcpStream {
     }
 
     fn poll_write_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<usize>> {
-        let (state, selector, stream, _) = self.split_borrow();
-        let map = state_as_waker_map(state, selector, stream).map_err(io_err_into_net_error)?;
-        #[cfg(not(target_os = "windows"))]
-        map.pop(InterestType::Writable);
-        map.add(InterestType::Writable, cx.waker());
-        map.add(InterestType::Closed, cx.waker());
-        if map.has_interest(InterestType::Closed) {
+        // A connect that outlived its deadline resolves the wait; `status()` reports TimedOut.
+        if self.connect_deadline.is_some() && self.connect_timed_out() {
+            self.connect_deadline = None;
             return Poll::Ready(Ok(0));
         }
 
-        #[cfg(not(target_os = "windows"))]
-        match libc_poll(stream.as_raw_fd(), libc::POLLOUT | libc::POLLHUP) {
-            Some(val) if (val & libc::POLLHUP) != 0 => {
-                return Poll::Ready(Ok(0));
+        let ready = {
+            let (state, selector, stream, _) = self.split_borrow();
+            let map =
+                state_as_waker_map(state, selector, stream).map_err(io_err_into_net_error)?;
+            #[cfg(not(target_os = "windows"))]
+            map.pop(InterestType::Writable);
+            map.add(InterestType::Writable, cx.waker());
+            map.add(InterestType::Closed, cx.waker());
+            if map.has_interest(InterestType::Closed) {
+                Some(0)
+            } else {
+                #[cfg(not(target_os = "windows"))]
+                let ready = match libc_poll(stream.as_raw_fd(), libc::POLLOUT | libc::POLLHUP) {
+                    Some(val) if (val & libc::POLLHUP) != 0 => Some(0),
+                    Some(val) if (val & libc::POLLOUT) != 0 => Some(10240),
+                    _ => None,
+                };
+
+                // In windows we can not poll the socket as it is not supported and hence
+                // what we do is immediately set the writable flag and relay on `mio` to
+                // refresh that flag when the state changes. In Linux what we do is actually
+                // make a non-blocking `poll` call to determine this state
+                #[cfg(target_os = "windows")]
+                let ready = map.has_interest(InterestType::Writable).then_some(10240);
+
+                ready
             }
-            Some(val) if (val & libc::POLLOUT) != 0 => return Poll::Ready(Ok(10240)),
-            _ => {}
+        };
+
+        if let Some(amt) = ready {
+            // Writable or hung up: the connect, if any, has resolved one way or the other.
+            self.connect_deadline = None;
+            return Poll::Ready(Ok(amt));
         }
 
-        // In windows we can not poll the socket as it is not supported and hence
-        // what we do is immediately set the writable flag and relay on `mio` to
-        // refresh that flag when the state changes. In Linux what we do is actually
-        // make a non-blocking `poll` call to determine this state
-        #[cfg(target_os = "windows")]
-        if map.has_interest(InterestType::Writable) {
-            return Poll::Ready(Ok(10240));
+        // Still connecting: the deadline timer wakes this waiter even if the socket never
+        // becomes writable (a blackholed peer).
+        if self.connect_deadline.is_some()
+            && let Some(targets) = &self.deadline_targets
+        {
+            targets.lock().unwrap().waker = Some(cx.waker().clone());
         }
 
         Poll::Pending
