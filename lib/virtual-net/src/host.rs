@@ -76,6 +76,22 @@ impl LocalNetworking {
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
     }
+
+    /// Wraps an already-connected [`std::net::TcpStream`] as a [`VirtualTcpSocket`] whose
+    /// `addr_peer()` reports `peer`.
+    pub fn adopt_tcp(
+        &self,
+        stream: std::net::TcpStream,
+        peer: SocketAddr,
+    ) -> Result<Box<dyn VirtualTcpSocket + Sync>> {
+        stream
+            .set_nonblocking(true)
+            .map_err(io_err_into_net_error)?;
+        let stream = mio::net::TcpStream::from_std(stream);
+        let socket = LocalTcpStream::new(self.selector.clone(), stream, peer);
+        *socket.connect_state.lock().unwrap() = ConnectState::Opened;
+        Ok(Box::new(socket))
+    }
 }
 
 impl Drop for LocalNetworking {
